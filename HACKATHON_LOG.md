@@ -29,9 +29,35 @@ No pre-existing code was used. Commits are the authoritative timeline.
 - Created `deploy/` — Dockerfiles, docker-compose.yml, Alibaba Cloud ECS setup guide
 - Created `.env.example` (no secrets committed)
 
+### Session 2 — Smoke test passed locally
+
+**Done:**
+- Verified QWEN_API_KEY (qwen3.6-flash responds)
+- Diagnosed and fixed Windows localhost IPv6-first issue in collector.py
+  (httpx was waiting ~2s for IPv6 timeout before IPv4 fallback;
+   fixed with `HTTPTransport(local_address='127.0.0.1')`)
+- Full smoke test passed locally:
+
+```
+INJECT #1 (overload):
+  ANOMALY: high_latency_critical
+  Memory: No similar incidents — fresh case
+  Qwen: "Service experiencing critical latency due to overload" confidence=0.85
+  Action: restart → outcome=restarted → Incident #1 saved
+
+INJECT #2 (same overload):
+  ANOMALY: high_latency_critical
+  Memory: Found 1 similar past incident (#1, action=restart, resolved=True)
+  Qwen: "Service overload causing critical latency" confidence=0.90 ← HIGHER due to memory
+  Action: restart → outcome=restarted → Incident #2 saved
+```
+
+Key: confidence rose 0.85 → 0.90 between cycles as Qwen gained memory context.
+Qwen LLM call latency: ~8-10s (acceptable, non-blocking).
+
 **Next:**
 - Obtain Alibaba Cloud ECS instance, deploy containers, get public URL
-- Run smoke test: inject fault → agent detects → Qwen diagnoses → action + memory write → re-inject → agent uses memory
+- Update DEMO_SERVICE_URL to use service hostname in docker-compose (already done)
 - Polish status page HTML
 
 ---
