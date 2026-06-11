@@ -1,0 +1,7 @@
+FROM python:3.11-slim
+WORKDIR /app
+COPY demo_service/requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+COPY demo_service/main.py .
+EXPOSE 8000
+CMD ["python", "main.py"]

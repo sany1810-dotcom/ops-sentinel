@@ -1,0 +1,34 @@
+version: "3.9"
+
+services:
+  demo-service:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.demo
+    container_name: ops-demo
+    ports:
+      - "8000:8000"
+    restart: unless-stopped
+
+  agent:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.agent
+    container_name: ops-agent
+    ports:
+      - "8001:8001"
+    volumes:
+      - agent-data:/data
+    environment:
+      - QWEN_API_KEY=${QWEN_API_KEY}
+      - QWEN_BASE_URL=${QWEN_BASE_URL:-https://dashscope-intl.aliyuncs.com/compatible-mode/v1}
+      - QWEN_MODEL=${QWEN_MODEL:-qwen3.6-flash}
+      - DEMO_SERVICE_URL=http://demo-service:8000
+      - AGENT_POLL_INTERVAL=${AGENT_POLL_INTERVAL:-10}
+      - AGENT_DB_PATH=/data/incidents.db
+    depends_on:
+      - demo-service
+    restart: unless-stopped
+
+volumes:
+  agent-data:
