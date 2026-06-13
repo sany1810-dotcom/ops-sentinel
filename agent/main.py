@@ -31,9 +31,9 @@ from qwen_client import QwenClient
 # ---------------------------------------------------------------------------
 # Config from environment
 # ---------------------------------------------------------------------------
-QWEN_API_KEY   = os.environ["QWEN_API_KEY"]
-QWEN_BASE_URL  = os.environ.get("QWEN_BASE_URL", "https://dashscope-intl.aliyuncs.com/compatible-mode/v1")
-QWEN_MODEL     = os.environ.get("QWEN_MODEL", "qwen3.6-flash")
+QWEN_API_KEY   = os.environ["QWEN_API_KEY"].strip()
+QWEN_BASE_URL  = os.environ.get("QWEN_BASE_URL", "https://dashscope-intl.aliyuncs.com/compatible-mode/v1").strip()
+QWEN_MODEL     = os.environ.get("QWEN_MODEL", "qwen3.6-flash").strip()
 DEMO_URL       = os.environ.get("DEMO_SERVICE_URL", "http://localhost:8000")
 POLL_INTERVAL  = int(os.environ.get("AGENT_POLL_INTERVAL", "10"))
 DB_PATH        = os.environ.get("AGENT_DB_PATH", "incidents.db")

@@ -1,8 +1,8 @@
 """
 Qwen LLM client — two operating modes:
 
-  Week 1 (fallback):  diagnose()              → plain prompt, direct memory context
-  Week 2 (MCP):       diagnose_with_mcp()     → Qwen tool-calling over MCP
+  Week 1 (fallback):  diagnose()              -> plain prompt, direct memory context
+  Week 2 (MCP):       diagnose_with_mcp()     -> Qwen tool-calling over MCP
 
 Resilience layers (both modes):
   1. Normal Qwen call (up to 3 retries with exponential backoff)
@@ -23,29 +23,67 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-# Actions the rule-based fallback will consider "restart-safe" only
-# if a past resolved incident used restart for the same symptom set.
-_ALWAYS_ALERT = True
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _sanitize_ascii(value: str, name: str) -> str:
+    """
+    Strip whitespace from an env-sourced string and verify it is pure ASCII.
+    Logs a diagnostic WITHOUT revealing the value if non-ASCII is found.
+    Raises ValueError so startup fails fast with a clear message.
+    """
+    value = value.strip()
+    try:
+        value.encode("ascii")
+    except UnicodeEncodeError as exc:
+        logger.error(
+            "Config error: %s contains non-ASCII characters at byte positions %d-%d "
+            "(encoding=%r). Check .env for BOM, invisible Unicode, or copy-paste "
+            "artefacts. Key length after strip: %d.",
+            name, exc.start, exc.end - 1, exc.encoding, len(value),
+        )
+        raise ValueError(
+            f"{name} has non-ASCII chars at positions {exc.start}-{exc.end - 1}. "
+            "Open .env in a hex editor and strip any BOM or invisible characters."
+        ) from exc
+    return value
 
 
 def _extract_json(text: str) -> dict:
     """Strip markdown fences and extract the first JSON object."""
     text = text.strip()
-    # Remove ```json ... ``` or ``` ... ```
     text = re.sub(r"```(?:json)?\s*", "", text)
     text = re.sub(r"```", "", text)
-    # Find first {...}
     m = re.search(r"\{.*\}", text, re.DOTALL)
     if m:
         return json.loads(m.group())
     return json.loads(text)
 
 
+def _safe_json(obj) -> str:
+    """Serialize to JSON with all non-ASCII escaped — safe for HTTP headers/bodies."""
+    return json.dumps(obj, ensure_ascii=True)
+
+
+# ---------------------------------------------------------------------------
+# Client
+# ---------------------------------------------------------------------------
+
 class QwenClient:
     def __init__(self, api_key: str, base_url: str, model: str):
+        # Fail fast at startup if the key/URL have encoding issues —
+        # better than a cryptic UnicodeEncodeError 60 s into the agent loop.
+        api_key  = _sanitize_ascii(api_key,  "QWEN_API_KEY")
+        base_url = _sanitize_ascii(base_url, "QWEN_BASE_URL")
+        model    = _sanitize_ascii(model,    "QWEN_MODEL")
+
         self._client = OpenAI(api_key=api_key, base_url=base_url, timeout=20.0)
-        self._model = model
+        self._model  = model
         self.degraded = False  # True when in safe-mode fallback
+
+    # ── Week 1 path ────────────────────────────────────────────────────────
 
     def diagnose(
         self,
@@ -68,10 +106,18 @@ class QwenClient:
                 return result
             except (APIError, APITimeoutError, APIConnectionError, json.JSONDecodeError) as exc:
                 wait = 2 ** attempt
-                logger.warning("Qwen attempt %d/3 failed (%s), retry in %ds", attempt + 1, exc, wait)
+                logger.warning("Qwen attempt %d/3 failed (%s), retry in %ds",
+                               attempt + 1, exc, wait)
                 time.sleep(wait)
+            except UnicodeEncodeError as exc:
+                logger.error(
+                    "UnicodeEncodeError in Qwen call (encoding=%r, positions %d-%d). "
+                    "Possible non-ASCII in API key or request content.",
+                    exc.encoding, exc.start, exc.end - 1,
+                )
+                break  # not transient — don't retry
             except Exception as exc:
-                logger.error("Unexpected Qwen error: %s", exc)
+                logger.error("Unexpected Qwen error: %s", type(exc).__name__, exc)
                 break
 
         logger.error("Qwen API unavailable — entering safe mode")
@@ -95,7 +141,7 @@ class QwenClient:
 
         prompt = (
             "You are an autonomous ops agent. Diagnose the issue and choose one action.\n\n"
-            f"Current metrics:\n{json.dumps(metrics, indent=2)}\n\n"
+            f"Current metrics:\n{_safe_json(metrics)}\n\n"
             f"Detected symptoms: {symptoms}\n\n"
             f"{history_block}\n\n"
             "Respond with ONLY a JSON object, no markdown:\n"
@@ -125,13 +171,8 @@ class QwenClient:
         mcp: "IncidentMCPClient",
     ) -> tuple[dict, list[dict]]:
         """
-        Agentic loop: Qwen calls MCP tools (search_similar_incidents, get_stats…)
-        to gather context autonomously, then produces a final diagnosis.
-
-        Returns:
-          (diagnosis_dict, tool_call_log)
-          diagnosis_dict — same shape as diagnose() output
-          tool_call_log  — [{tool, args, result}, …] for observability
+        Agentic loop: Qwen calls MCP tools to gather context, then decides.
+        Returns (diagnosis_dict, tool_call_log).
         """
         for attempt in range(3):
             try:
@@ -146,13 +187,21 @@ class QwenClient:
                 logger.warning("Qwen/MCP attempt %d/3 failed (%s), retry in %ds",
                                attempt + 1, exc, wait)
                 time.sleep(wait)
+            except UnicodeEncodeError as exc:
+                # Pinpoint WHERE so we don't have to guess next time
+                logger.error(
+                    "UnicodeEncodeError in Qwen/MCP call: encoding=%r, "
+                    "positions %d-%d, reason=%s. "
+                    "Likely cause: non-ASCII in QWEN_API_KEY or tool result content.",
+                    exc.encoding, exc.start, exc.end - 1, exc.reason,
+                )
+                break  # not transient — don't retry
             except Exception as exc:
-                logger.error("Unexpected Qwen/MCP error: %s", exc)
+                logger.error("Unexpected Qwen/MCP error: %s: %s", type(exc).__name__, exc)
                 break
 
-        logger.error("Qwen/MCP unavailable — entering safe mode")
+        logger.error("Qwen/MCP unavailable -- entering safe mode")
         self.degraded = True
-        # Fall back to Week 1 rule-based (no MCP memory needed)
         result = self._rule_based_fallback(symptoms, [])
         result["safe_mode"] = True
         return result, []
@@ -162,7 +211,7 @@ class QwenClient:
     ) -> tuple[dict, list[dict]]:
         prompt = (
             "You are an autonomous ops agent. An anomaly has been detected.\n\n"
-            f"Current metrics:\n{json.dumps(metrics, indent=2)}\n\n"
+            f"Current metrics:\n{_safe_json(metrics)}\n\n"
             f"Detected symptoms: {symptoms}\n\n"
             "Use the available tools to search for similar past incidents and gather context. "
             "Then respond with ONLY a JSON object (no markdown, no thinking tags):\n"
@@ -192,7 +241,6 @@ class QwenClient:
             msg = resp.choices[0].message
 
             if not msg.tool_calls:
-                # Final text answer
                 return _extract_json(msg.content), tool_call_log
 
             # Append assistant message (with tool_calls) to history
@@ -212,7 +260,7 @@ class QwenClient:
                 ],
             })
 
-            # Execute each tool call via MCP and collect results
+            # Execute each tool call via MCP and feed results back
             for tc in msg.tool_calls:
                 args = json.loads(tc.function.arguments)
                 try:
@@ -225,24 +273,27 @@ class QwenClient:
                     "args": args,
                     "result": tool_result,
                 })
-                logger.info("MCP tool call: %s(%s) → %s",
+                # Use json.dumps (ensure_ascii=True by default) so non-ASCII in
+                # stored diagnoses is escaped — safe for log streams and HTTP body
+                logger.info("MCP tool call: %s(%s) -> %s",
                             tc.function.name,
-                            json.dumps(args)[:80],
-                            str(tool_result)[:120])
+                            _safe_json(args)[:80],
+                            _safe_json(tool_result)[:120])
 
                 messages.append({
                     "role": "tool",
                     "tool_call_id": tc.id,
-                    "content": json.dumps(tool_result),
+                    # ensure_ascii=True: diagnoses from DB may contain non-ASCII;
+                    # escape them so the HTTP body stays pure ASCII-in-JSON
+                    "content": _safe_json(tool_result),
                 })
 
         raise RuntimeError("Agentic loop exceeded max rounds without final answer")
 
-    # ── Week 1 / fallback ─────────────────────────────────────────────────
+    # ── fallback ──────────────────────────────────────────────────────────
 
     def _rule_based_fallback(self, symptoms: list[str], similar: list[Incident]) -> dict:
         action = "alert"
-        # Escalate to restart only if a past incident with same symptoms was resolved by restart
         for inc in similar:
             if (
                 inc.resolved
@@ -256,5 +307,5 @@ class QwenClient:
             "diagnosis": f"[SAFE MODE] Detected symptoms: {', '.join(symptoms)}",
             "action": action,
             "confidence": 0.4,
-            "reasoning": "Rule-based fallback — Qwen API unavailable after 3 retries",
+            "reasoning": "Rule-based fallback -- Qwen API unavailable after 3 retries",
         }
