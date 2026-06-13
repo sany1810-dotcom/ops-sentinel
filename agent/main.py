@@ -329,7 +329,7 @@ _HTML = """<!DOCTYPE html>
 
 <h2>MCP Tool Calls — Last Anomaly Cycle</h2>
 <table>
-<tr><th>Tool</th><th>Arguments</th><th>Result (truncated)</th></tr>
+<tr><th>Tool</th><th>Arguments</th><th>Result / Similarity</th></tr>
 {mcp_rows}
 </table>
 
@@ -381,13 +381,33 @@ def _render_status(state: dict, incidents) -> str:
     if mcp_calls:
         mcp_parts = []
         for c in mcp_calls:
-            args_s  = _json.dumps(c.get("args", {}))[:80]
-            res_s   = _json.dumps(c.get("result", ""))[:120]
+            tool   = c.get("tool", "")
+            args_s = _json.dumps(c.get("args", {}))[:80]
+            result = c.get("result", "")
+            full_res_s = _json.dumps(result)
+
+            # Surface similarity scores prominently for semantic search results
+            if tool == "search_similar_incidents" and isinstance(result, list) and result:
+                hits = [h for h in result[:3] if isinstance(h, dict)]
+                if hits:
+                    mode = hits[0].get("search_mode", "")
+                    scores = ", ".join(
+                        f"id={h.get('id')} sim={h.get('similarity_score', '?'):.3f}"
+                        if isinstance(h.get("similarity_score"), float)
+                        else f"id={h.get('id')}"
+                        for h in hits
+                    )
+                    res_s = f"[{mode}] {scores}" if mode else scores
+                else:
+                    res_s = "no hits"
+            else:
+                res_s = full_res_s[:120]
+
             mcp_parts.append(
                 f"<tr>"
-                f"<td><b>{c.get('tool', '')}</b></td>"
+                f"<td><b>{tool}</b></td>"
                 f"<td class='result-cell' title='{args_s}'>{args_s}</td>"
-                f"<td class='result-cell' title='{res_s}'>{res_s}</td>"
+                f"<td class='result-cell' title='{full_res_s[:500]}'>{res_s}</td>"
                 f"</tr>"
             )
         mcp_rows = "\n".join(mcp_parts)
