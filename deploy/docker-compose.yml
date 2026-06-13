@@ -20,6 +20,9 @@ services:
     environment:
       - AGENT_DB_PATH=/data/incidents.db
       - MCP_PORT=8002
+      - QWEN_API_KEY=${QWEN_API_KEY}
+      - QWEN_BASE_URL=${QWEN_BASE_URL:-https://dashscope-intl.aliyuncs.com/compatible-mode/v1}
+      - QWEN_EMBED_MODEL=${QWEN_EMBED_MODEL:-text-embedding-v3}
     restart: unless-stopped
 
   agent:
