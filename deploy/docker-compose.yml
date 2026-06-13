@@ -9,6 +9,19 @@ services:
     # Not exposed publicly — only accessible within Docker network via demo-service:8000
     restart: unless-stopped
 
+  incident-mcp-server:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.mcp
+    container_name: ops-mcp
+    # Not exposed publicly — agent connects via incident-mcp-server:8002
+    volumes:
+      - agent-data:/data
+    environment:
+      - AGENT_DB_PATH=/data/incidents.db
+      - MCP_PORT=8002
+    restart: unless-stopped
+
   agent:
     build:
       context: ..
@@ -23,10 +36,12 @@ services:
       - QWEN_BASE_URL=${QWEN_BASE_URL:-https://dashscope-intl.aliyuncs.com/compatible-mode/v1}
       - QWEN_MODEL=${QWEN_MODEL:-qwen3.6-flash}
       - DEMO_SERVICE_URL=http://demo-service:8000
+      - MCP_SERVER_URL=http://incident-mcp-server:8002/mcp
       - AGENT_POLL_INTERVAL=${AGENT_POLL_INTERVAL:-10}
       - AGENT_DB_PATH=/data/incidents.db
     depends_on:
       - demo-service
+      - incident-mcp-server
     restart: unless-stopped
 
 volumes:

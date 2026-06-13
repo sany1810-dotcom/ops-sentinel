@@ -56,8 +56,87 @@ Key: confidence rose 0.85 → 0.90 between cycles as Qwen gained memory context.
 Qwen LLM call latency: ~8-10s (acceptable, non-blocking).
 
 **Next:**
-- Obtain Alibaba Cloud ECS instance, deploy containers, get public URL
-- Update DEMO_SERVICE_URL to use service hostname in docker-compose (already done)
-- Polish status page HTML
+- Week 2: Add MCP layer
+
+---
+
+## Week 2 — 2026-06-13
+
+### Session 3 — MCP server + agentic tool-calling
+
+**Done (§0):**
+- Read MCP documentation (modelcontextprotocol.io + Python SDK GitHub)
+- Confirmed: SDK v1.27.2, FastMCP API, Streamable HTTP is current recommended transport
+- Endpoint: `/mcp`, client: `streamablehttp_client`, server: `mcp.run(transport="streamable-http")`
+
+**Done (§1 — MCP server in isolation):**
+- Created `incident_mcp_server/main.py` — FastMCP server, Streamable HTTP, port 8002
+  - Reuses `agent/memory.py` (zero duplication)
+  - Tools: `search_similar_incidents`, `record_incident`, `get_recent_incidents`, `get_stats`
+  - Resources: `incidents://recent`, `incidents://stats`
+- Created `incident_mcp_server/requirements.txt` (`mcp[cli]>=1.0.0`)
+- Created `incident_mcp_server/smoke_test.py` — async MCP client test
+- Smoke test passed: all 4 tools + 2 resources verified in isolation (server not connected to agent)
+- Key finding: FastMCP v1.x returns each element of a `list[dict]` tool result as a separate TextContent item
+
+**Done (§2 — Agent as MCP client + Qwen tool-calling):**
+- Created `agent/mcp_client.py` — `IncidentMCPClient` class
+  - Synchronous wrapper around async MCP SDK
+  - Background asyncio event loop in daemon thread
+  - Per-call short-lived sessions (simple, no session expiry issues)
+  - `probe()` on startup, `reconnect()` available for recovery
+- Modified `qwen_client.py` — added `diagnose_with_mcp()` method
+  - Full agentic loop: Qwen calls MCP tools via OpenAI function-calling API
+  - Tool results fed back to Qwen; loop continues until no more tool calls
+  - Safety cap: max 6 rounds
+  - Keeps original `diagnose()` method untouched (Week 1 fallback)
+- Modified `agent/main.py` — wired MCP into agent loop
+  - `MCP_SERVER_URL` env var (default: `http://localhost:8002/mcp`)
+  - MCP-first path: `diagnose_with_mcp()` → Qwen calls tools autonomously
+  - Falls back to Week 1 path on any MCP failure (§4)
+  - Incident recording also routed through MCP when available
+
+**Done (§3 — MCP observability on status page):**
+- `last_mcp_calls` tracked in shared agent state (tool name, args, result per call)
+- Status page has new "MCP Tool Calls — Last Anomaly Cycle" table
+- MCP ON/OFF badge shown next to agent status
+- New API endpoint: `GET /api/mcp/calls` for JSON access
+- `GET /health` now includes `"mcp": true/false`
+
+**Done (§4 — Safe-mode preserved):**
+- MCP down at startup → `mcp.available = False` → agent uses Week 1 direct path
+- MCP tool call exception during cycle → catches exception → falls back to Week 1
+- `qwen.diagnose_with_mcp()` failure → falls back to `_rule_based_fallback()`
+- Background reconnect attempt after each failed cycle
+
+**Done (§5 — Architecture diagram):**
+- ASCII diagram in README.md showing all three containers + data flow
+
+**Done (§6 — Three-container docker-compose):**
+- Created `deploy/Dockerfile.mcp`
+- Added `incident-mcp-server` service to `docker-compose.yml`
+  - Shares `agent-data` volume with agent (same `/data/incidents.db`)
+  - No public port — only accessible by agent at `incident-mcp-server:8002`
+- Agent `depends_on: [demo-service, incident-mcp-server]`
+- Updated `Dockerfile.agent` to install `mcp[cli]>=1.0.0`
+- Added `mcp[cli]>=1.0.0` to `agent/requirements.txt`
+
+**End-to-end verification (local):**
+```
+MCP server: 4 tools, 2 resources — smoke test passed
+Agentic loop test:
+  metrics={rss_mb:350, latency_ms:2800, fault:"overload"}
+  symptoms=["high_latency", "high_rss"]
+
+  Qwen called: search_similar_incidents(symptoms=["high_latency","high_rss"], limit=5)
+  Result: 2 past incidents with overlapping symptoms
+
+  Final diagnosis:
+    "Transient service overload causing elevated memory usage and latency"
+    action=restart  confidence=0.90
+```
+
+**Next:**
+- Deploy Week 2 to Alibaba Cloud ECS 47.237.196.56 (`docker compose up -d`)
 
 ---

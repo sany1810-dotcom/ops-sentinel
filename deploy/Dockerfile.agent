@@ -2,6 +2,8 @@ FROM python:3.11-slim
 WORKDIR /app
 COPY agent/requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
+# MCP client depends on the mcp package
+RUN pip install --no-cache-dir "mcp[cli]>=1.0.0"
 COPY agent/ .
 VOLUME ["/data"]
 EXPOSE 8001

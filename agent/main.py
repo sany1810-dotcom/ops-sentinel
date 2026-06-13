@@ -1,8 +1,12 @@
 """
-Ops-Sentinel Agent
-==================
-Background thread: poll → detect → retrieve memory → call Qwen → act → store
-FastAPI server:    status page (HTML) + JSON API + demo fault-injection proxy
+Ops-Sentinel Agent  (Week 2: MCP + Qwen tool-calling)
+======================================================
+Background thread:
+  poll → detect → [MCP] Qwen calls tools → act → [MCP] record → store
+
+FastAPI server:  status page + JSON API + demo fault-injection proxy
+
+Week 1 behaviour is preserved as safe-mode fallback when MCP server is down.
 """
 import logging
 import os
@@ -20,6 +24,7 @@ from pydantic import BaseModel
 from actions import ActionExecutor
 from collector import MetricsCollector, _TRANSPORT
 from detector import AnomalyDetector
+from mcp_client import IncidentMCPClient
 from memory import Incident, IncidentMemory
 from qwen_client import QwenClient
 
@@ -32,6 +37,7 @@ QWEN_MODEL     = os.environ.get("QWEN_MODEL", "qwen3.6-flash")
 DEMO_URL       = os.environ.get("DEMO_SERVICE_URL", "http://localhost:8000")
 POLL_INTERVAL  = int(os.environ.get("AGENT_POLL_INTERVAL", "10"))
 DB_PATH        = os.environ.get("AGENT_DB_PATH", "incidents.db")
+MCP_SERVER_URL = os.environ.get("MCP_SERVER_URL", "http://localhost:8002/mcp")
 
 logging.basicConfig(
     level=logging.INFO,
@@ -46,10 +52,12 @@ _state_lock = threading.Lock()
 _agent_state = {
     "status": "starting",
     "safe_mode": False,
+    "mcp_available": False,
     "last_check": None,
     "last_metrics": {},
     "last_symptoms": [],
     "last_incident_id": None,
+    "last_mcp_calls": [],   # [{tool, args, result}, …] from most recent cycle
     "total_incidents": 0,
     "uptime_start": datetime.now(timezone.utc).isoformat(),
 }
@@ -74,9 +82,10 @@ def _agent_loop(
     memory: IncidentMemory,
     qwen: QwenClient,
     executor: ActionExecutor,
+    mcp: IncidentMCPClient,
 ):
     logger.info("Agent loop started (poll every %ds)", POLL_INTERVAL)
-    _update_state(status="healthy")
+    _update_state(status="healthy", mcp_available=mcp.available)
 
     while True:
         if executor.halted:
@@ -86,7 +95,7 @@ def _agent_loop(
             continue
 
         try:
-            _tick(collector, detector, memory, qwen, executor)
+            _tick(collector, detector, memory, qwen, executor, mcp)
         except Exception as exc:
             logger.exception("Unhandled error in agent tick: %s", exc)
 
@@ -99,6 +108,7 @@ def _tick(
     memory: IncidentMemory,
     qwen: QwenClient,
     executor: ActionExecutor,
+    mcp: IncidentMCPClient,
 ):
     snap = collector.collect()
     now = datetime.now(timezone.utc).isoformat()
@@ -116,7 +126,8 @@ def _tick(
     _update_state(last_symptoms=result.symptoms)
 
     if not result.is_anomaly:
-        _update_state(status="healthy", safe_mode=qwen.degraded)
+        _update_state(status="healthy", safe_mode=qwen.degraded,
+                      mcp_available=mcp.available)
         logger.debug("No anomaly. rss=%.1fMB lat=%.0fms err=%.2f",
                      snap.rss_mb, snap.latency_ms, snap.error_rate)
         return
@@ -125,27 +136,39 @@ def _tick(
                    result.symptoms, result.severity)
     _update_state(status="anomaly")
 
-    similar = memory.find_similar(result.symptoms)
-    if similar:
-        logger.info("Found %d similar past incident(s) in memory", len(similar))
-        for inc in similar[:2]:
-            logger.info("  past#%d symptoms=%s action=%s resolved=%s",
-                        inc.id, inc.symptoms, inc.action, inc.resolved)
-    else:
-        logger.info("No similar incidents in memory — fresh case")
+    # ── Diagnosis: try MCP agentic loop, fall back to Week 1 ───────────────
+    tool_log: list[dict] = []
 
-    diagnosis = qwen.diagnose(metrics_dict, result.symptoms, similar)
-    _update_state(safe_mode=diagnosis.get("safe_mode", False))
+    if mcp.available:
+        logger.info("Using MCP agentic loop (Qwen + tool-calling)")
+        try:
+            diagnosis, tool_log = qwen.diagnose_with_mcp(metrics_dict, result.symptoms, mcp)
+        except Exception as exc:
+            logger.warning("MCP agentic loop failed (%s) — falling back to Week 1", exc)
+            mcp.available = False
+            diagnosis = _week1_diagnose(memory, qwen, metrics_dict, result.symptoms)
+    else:
+        # Attempt reconnect every 5 minutes (300s / POLL_INTERVAL ticks)
+        logger.info("MCP unavailable — using Week 1 direct memory path")
+        diagnosis = _week1_diagnose(memory, qwen, metrics_dict, result.symptoms)
+        # Non-blocking reconnect attempt in background
+        threading.Thread(target=mcp.reconnect, daemon=True).start()
+
+    _update_state(
+        safe_mode=diagnosis.get("safe_mode", False),
+        mcp_available=mcp.available,
+        last_mcp_calls=tool_log,
+    )
 
     action     = diagnosis.get("action", "alert")
     confidence = diagnosis.get("confidence", 0.0)
 
-    logger.info("Qwen diagnosis: %s | action=%s confidence=%.2f safe_mode=%s",
-                diagnosis.get("diagnosis"), action, confidence,
-                diagnosis.get("safe_mode"))
+    logger.info("Diagnosis: %s | action=%s confidence=%.2f mcp=%s",
+                diagnosis.get("diagnosis"), action, confidence, mcp.available)
 
     outcome = executor.execute(action, diagnosis.get("diagnosis", ""))
 
+    # ── Record incident (via MCP if available, else direct) ────────────────
     inc = Incident(
         ts=now,
         metrics_snapshot=metrics_dict,
@@ -155,12 +178,46 @@ def _tick(
         outcome=outcome,
         resolved=(outcome in {"restarted", "halted"}),
     )
-    inc_id = memory.save(inc)
+
+    if mcp.available:
+        try:
+            rec = mcp.call_tool("record_incident", {
+                "ts": inc.ts,
+                "symptoms": inc.symptoms,
+                "metrics_snapshot": inc.metrics_snapshot,
+                "diagnosis": inc.diagnosis,
+                "action": inc.action,
+                "outcome": inc.outcome,
+                "resolved": inc.resolved,
+            })
+            inc_id = rec.get("id") if isinstance(rec, dict) else None
+            logger.info("Incident recorded via MCP → id=%s (outcome=%s)", inc_id, outcome)
+        except Exception as exc:
+            logger.warning("MCP record_incident failed (%s) — saving directly", exc)
+            inc_id = memory.save(inc)
+    else:
+        inc_id = memory.save(inc)
+        logger.info("Incident #%d saved to memory directly (outcome=%s)", inc_id, outcome)
+
     _update_state(
         last_incident_id=inc_id,
         total_incidents=_agent_state["total_incidents"] + 1,
     )
-    logger.info("Incident #%d saved to memory (outcome=%s)", inc_id, outcome)
+
+
+def _week1_diagnose(
+    memory: IncidentMemory,
+    qwen: QwenClient,
+    metrics_dict: dict,
+    symptoms: list[str],
+) -> dict:
+    """Week 1 path: query SQLite directly, call Qwen with pre-fetched context."""
+    similar = memory.find_similar(symptoms)
+    if similar:
+        logger.info("Found %d similar past incident(s) in memory", len(similar))
+    else:
+        logger.info("No similar incidents in memory — fresh case")
+    return qwen.diagnose(metrics_dict, symptoms, similar)
 
 
 # ---------------------------------------------------------------------------
@@ -168,9 +225,7 @@ def _tick(
 # ---------------------------------------------------------------------------
 app = FastAPI(title="Ops-Sentinel")
 
-# ---------------------------------------------------------------------------
-# Demo fault-injection proxy (so judges can trigger faults via port 80)
-# ---------------------------------------------------------------------------
+
 class InjectRequest(BaseModel):
     fault: Literal["overload", "memory_leak", "dependency_down"]
 
@@ -181,7 +236,6 @@ def _demo_client() -> httpx.Client:
 
 @app.post("/demo/inject")
 async def demo_inject(req: InjectRequest):
-    """Proxy to demo service /inject — allows fault injection without exposing port 8000."""
     try:
         with _demo_client() as c:
             r = c.post(f"{DEMO_URL}/inject", json={"fault": req.fault})
@@ -193,7 +247,6 @@ async def demo_inject(req: InjectRequest):
 
 @app.post("/demo/reset")
 async def demo_reset():
-    """Proxy to demo service /reset."""
     try:
         with _demo_client() as c:
             r = c.post(f"{DEMO_URL}/reset")
@@ -205,7 +258,6 @@ async def demo_reset():
 
 @app.get("/demo/metrics")
 async def demo_metrics():
-    """Proxy to demo service /metrics."""
     try:
         with _demo_client() as c:
             r = c.get(f"{DEMO_URL}/metrics")
@@ -234,6 +286,8 @@ _HTML = """<!DOCTYPE html>
   .anomaly{{background:#6e3513;color:#f0883e}}
   .halted {{background:#6e1313;color:#f85149}}
   .safe   {{background:#5a3e00;color:#e3b341}}
+  .mcp-on {{background:#0d3b6e;color:#79c0ff}}
+  .mcp-off{{background:#3b3b3b;color:#8b949e}}
   table{{border-collapse:collapse;width:100%;margin-top:.4rem}}
   th,td{{border:1px solid #30363d;padding:5px 10px;text-align:left;font-size:.85rem}}
   th{{background:#161b22;color:#8b949e}}
@@ -246,6 +300,7 @@ _HTML = """<!DOCTYPE html>
   .btn-reset{{background:#1f6b2e;color:#56d364}}
   .btn-reset:hover{{background:#2a8a3e}}
   #msg{{margin:.4rem 0;color:#e3b341;min-height:1.2em;font-size:.85rem}}
+  .result-cell{{max-width:400px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:.78rem}}
   footer{{margin-top:1.5rem;color:#484f58;font-size:.75rem}}
 </style>
 </head>
@@ -253,6 +308,7 @@ _HTML = """<!DOCTYPE html>
 <h1>Ops-Sentinel <span style="color:#484f58;font-weight:normal;font-size:.7em">/ Qwen Cloud Hackathon Track 1: MemoryAgent</span></h1>
 <p>Status: <span class="badge {status_cls}">{status}</span>
 {safe_badge}
+<span class="badge {mcp_cls}">MCP {mcp_label}</span>
 &nbsp;&nbsp;<span class="ts">Last check: {last_check}</span>
 &nbsp;&nbsp;<span class="ts">Total incidents: {total_incidents}</span></p>
 
@@ -269,6 +325,12 @@ _HTML = """<!DOCTYPE html>
 <table>
 <tr><th>Metric</th><th>Value</th></tr>
 {metrics_rows}
+</table>
+
+<h2>MCP Tool Calls — Last Anomaly Cycle</h2>
+<table>
+<tr><th>Tool</th><th>Arguments</th><th>Result (truncated)</th></tr>
+{mcp_rows}
 </table>
 
 <h2>Recent Incidents — Memory (last 10)</h2>
@@ -298,16 +360,39 @@ async function resetDemo() {{
 
 
 def _render_status(state: dict, incidents) -> str:
+    import json as _json
+
     status = state.get("status", "unknown")
     status_cls = status if status in {"healthy", "anomaly", "halted"} else "anomaly"
     safe_badge = (
         '<span class="badge safe">SAFE MODE</span>' if state.get("safe_mode") else ""
     )
+    mcp_on = state.get("mcp_available", False)
+    mcp_cls   = "mcp-on" if mcp_on else "mcp-off"
+    mcp_label = "ON" if mcp_on else "OFF"
 
     metrics = state.get("last_metrics", {})
     metrics_rows = "\n".join(
         f"<tr><td>{k}</td><td>{v}</td></tr>" for k, v in metrics.items()
     ) or "<tr><td colspan=2>No data yet</td></tr>"
+
+    # MCP tool call log
+    mcp_calls = state.get("last_mcp_calls", [])
+    if mcp_calls:
+        mcp_parts = []
+        for c in mcp_calls:
+            args_s  = _json.dumps(c.get("args", {}))[:80]
+            res_s   = _json.dumps(c.get("result", ""))[:120]
+            mcp_parts.append(
+                f"<tr>"
+                f"<td><b>{c.get('tool', '')}</b></td>"
+                f"<td class='result-cell' title='{args_s}'>{args_s}</td>"
+                f"<td class='result-cell' title='{res_s}'>{res_s}</td>"
+                f"</tr>"
+            )
+        mcp_rows = "\n".join(mcp_parts)
+    else:
+        mcp_rows = "<tr><td colspan=3 style='color:#484f58'>No MCP calls yet — waiting for next anomaly</td></tr>"
 
     incident_rows_parts = []
     for inc in incidents:
@@ -320,7 +405,7 @@ def _render_status(state: dict, incidents) -> str:
             f"<td>{diag}</td>"
             f"<td>{inc.action}</td>"
             f"<td>{inc.outcome}</td>"
-            f"<td>{'✓' if inc.resolved else '✗'}</td>"
+            f"<td>{'&#10003;' if inc.resolved else '&#10007;'}</td>"
             f"</tr>"
         )
     incident_rows = "\n".join(incident_rows_parts) or (
@@ -333,9 +418,12 @@ def _render_status(state: dict, incidents) -> str:
         status=status.upper(),
         status_cls=status_cls,
         safe_badge=safe_badge,
+        mcp_cls=mcp_cls,
+        mcp_label=mcp_label,
         last_check=(state.get("last_check") or "—")[:19],
         total_incidents=state.get("total_incidents", 0),
         metrics_rows=metrics_rows,
+        mcp_rows=mcp_rows,
         incident_rows=incident_rows,
         uptime=uptime,
     )
@@ -363,9 +451,16 @@ async def api_incidents():
     ])
 
 
+@app.get("/api/mcp/calls")
+async def api_mcp_calls():
+    """Last MCP tool calls for the most recent anomaly cycle."""
+    return JSONResponse(_get_state().get("last_mcp_calls", []))
+
+
 @app.get("/health")
 async def health():
-    return {"status": "ok", "agent": _get_state().get("status")}
+    state = _get_state()
+    return {"status": "ok", "agent": state.get("status"), "mcp": state.get("mcp_available")}
 
 
 # ---------------------------------------------------------------------------
@@ -381,10 +476,11 @@ def main():
     detector  = AnomalyDetector()
     qwen      = QwenClient(QWEN_API_KEY, QWEN_BASE_URL, QWEN_MODEL)
     executor  = ActionExecutor(collector)
+    mcp       = IncidentMCPClient(MCP_SERVER_URL)
 
     t = threading.Thread(
         target=_agent_loop,
-        args=(collector, detector, _memory, qwen, executor),
+        args=(collector, detector, _memory, qwen, executor, mcp),
         daemon=True,
         name="agent-loop",
     )

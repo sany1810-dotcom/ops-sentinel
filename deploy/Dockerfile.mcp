@@ -1,0 +1,10 @@
+FROM python:3.11-slim
+WORKDIR /app
+COPY incident_mcp_server/requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+# Copy memory.py alongside main.py so the sys.path fallback finds it
+COPY agent/memory.py ./memory.py
+COPY incident_mcp_server/ .
+VOLUME ["/data"]
+EXPOSE 8002
+CMD ["python", "main.py"]
