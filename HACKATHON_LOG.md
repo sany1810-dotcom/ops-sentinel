@@ -136,7 +136,42 @@ Agentic loop test:
     action=restart  confidence=0.90
 ```
 
-**Next:**
-- Deploy Week 2 to Alibaba Cloud ECS 47.237.196.56 (`docker compose up -d`)
+### Session 4 — Bug fix + deployment to Alibaba Cloud ECS
+
+**Bug fixed:**
+- Production agent fell into safe-mode with `UnicodeEncodeError: 'ascii' codec
+  can't encode characters in position 7-15`
+- Root cause: `str(tool_result)` in the MCP tool-call log line produced raw Unicode
+  (Russian diagnosis text from SQLite), which failed on ASCII-locale Docker container
+- Fix in `qwen_client.py`:
+  - `_sanitize_ascii()` — fails fast at startup if QWEN_API_KEY/URL/MODEL have
+    non-ASCII (logs positions, never reveals key value)
+  - `_safe_json()` wrapper — `json.dumps(ensure_ascii=True)` everywhere tool results
+    are serialised for logs or HTTP body
+  - Replaced unicode arrow `->` in log format strings (ASCII-safe)
+  - Added dedicated `except UnicodeEncodeError` branch with encoding/position/reason
+    logged for unambiguous diagnosis
+  - `main.py`: `.strip()` all env vars at read time
+
+**Deployed to Alibaba Cloud ECS 47.237.196.56:**
+- Three containers: `ops-demo`, `incident-mcp-server`, `ops-agent`
+- Shared `agent-data` Docker volume for `incidents.db`
+- MCP server on internal port 8002 (not exposed publicly)
+- Agent on public port 80
+
+**Live agentic cycle confirmed:**
+```
+MCP server: 4 tools online (search_similar_incidents, record_incident,
+            get_recent_incidents, get_stats) + 2 resources
+Agent cycle (MCP ON):
+  Anomaly detected -> symptoms: [high_latency, high_rss]
+  Qwen called: search_similar_incidents(symptoms=[...], limit=5) via MCP
+  Result: past incidents retrieved from memory
+  Final diagnosis: action=restart  confidence=0.90  safe_mode=false
+  Incident recorded via MCP record_incident
+  No [SAFE MODE] prefix — autonomous Qwen + MCP loop working
+```
+
+Status page: http://47.237.196.56 (MCP ON badge, tool call log visible)
 
 ---
