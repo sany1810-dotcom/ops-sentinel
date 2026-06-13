@@ -6,8 +6,7 @@ services:
       context: ..
       dockerfile: deploy/Dockerfile.demo
     container_name: ops-demo
-    ports:
-      - "8000:8000"
+    # Not exposed publicly — only accessible within Docker network via demo-service:8000
     restart: unless-stopped
 
   agent:
@@ -16,7 +15,7 @@ services:
       dockerfile: deploy/Dockerfile.agent
     container_name: ops-agent
     ports:
-      - "8001:8001"
+      - "80:8001"   # Status page + fault-injection proxy on public port 80
     volumes:
       - agent-data:/data
     environment:
