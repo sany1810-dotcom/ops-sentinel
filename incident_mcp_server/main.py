@@ -164,12 +164,18 @@ def record_incident(
     incident_id = _memory.save(inc)
 
     embedded = False
-    if _embedder and _embedder.available:
+    if _embedder is None:
+        _log.warning("record_incident id=%d: no embedder, skipping embedding", incident_id)
+    else:
         text = build_embed_text(symptoms, metrics_snapshot, diagnosis)
         vec  = _embedder.embed(text)
         if vec is not None:
             _memory.save_embedding(incident_id, _embedder._model, vec)
             embedded = True
+            _log.info("record_incident id=%d: embedded OK", incident_id)
+        else:
+            _log.warning("record_incident id=%d: embed() returned None, "
+                         "incident saved without vector", incident_id)
 
     return {"id": incident_id, "status": "recorded", "embedded": embedded}
 
