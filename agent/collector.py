@@ -9,10 +9,11 @@ logger = logging.getLogger(__name__)
 
 PROBE_TIMEOUT = 6.0   # probe /health with a generous timeout so overload is observable
 
-# On Windows, 'localhost' resolves to IPv6 first causing a ~2s delay before IPv4 fallback.
-# Forcing local_address='127.0.0.1' bypasses this. In Docker, service names resolve
-# directly so this has no effect.
-_TRANSPORT = httpx.HTTPTransport(local_address="127.0.0.1")
+# local_address="127.0.0.1" was here to fix Windows IPv6 localhost resolution delay,
+# but it binds the outgoing socket to loopback, which Linux kernel rejects (EINVAL)
+# when the destination is another Docker container. Removed: service names don't
+# have the IPv6 ambiguity, so the workaround was never needed in production.
+_TRANSPORT = httpx.HTTPTransport()
 
 
 def _client(timeout: float) -> httpx.Client:
