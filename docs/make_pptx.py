@@ -185,8 +185,7 @@ arrow(s4, 7.85, 4.35, 7.85, 5.3, color=YELLOW)        # tools→embed (vertical)
 arrow(s4, 10.2, 1.97, 10.2, 1.97, color=DIM)          # agent→status (same row)
 arrow(s4, 6.0,  3.92, 6.6, 3.92, color=DIM)           # mcp→tools
 
-# bidirectional label
-txb(s4, "tool-calls", 6.05, 1.62, 0.9, 0.3, size=10, color=ACCENT, align=PP_ALIGN.CENTER)
+# bidirectional arrow label removed — overlapped with Qwen box; arrow is self-explanatory
 
 # safe-mode note
 txb(s4, "safe-mode: MCP down → direct SQLite  |  Qwen down → rule-based",
@@ -223,14 +222,14 @@ s6 = slide()
 txb(s6, "Semantic Incident Memory", 0.7, 0.4, 12, 0.8, size=38, bold=True, color=ACCENT)
 hline(s6, 1.35)
 
-# Left column: how it works
+# Left column: how it works — starts at 1.65 (below the 1.35 hline + comfortable gap)
 bullet_block(s6, [
     "Every incident embedded with text-embedding-v3  (1024-dim)",
     "Stored as float32 BLOB in SQLite incident_embeddings table",
     "Query: build_embed_text(symptoms + metrics) → cosine similarity",
     "Returns top-N incidents with similarity_score  (0.0 – 1.0)",
     "Finds conceptually similar faults — no keyword overlap needed",
-], x=0.7, y=1.6, w=6.8, size=19, color=WHITE, gap=0.63)
+], x=0.7, y=1.65, w=6.8, size=19, color=WHITE, gap=0.68)
 
 # Right column: UI evidence box
 r = s6.shapes.add_shape(1, Inches(7.8), Inches(1.55), Inches(5.0), Inches(3.6))
@@ -240,7 +239,9 @@ r.line.color.rgb = ACCENT; r.line.width = Pt(1)
 txb(s6, "Status Page — MCP Tool Calls", 7.9, 1.65, 4.8, 0.4, size=13, color=DIM)
 txb(s6, "Tool", 7.9, 2.05, 2.2, 0.35, size=13, bold=True, color=DIM)
 txb(s6, "Result / Similarity", 10.1, 2.05, 2.6, 0.35, size=13, bold=True, color=DIM)
-hline(s6, 2.45)
+# Short separator only inside the right-column box — avoids cutting through left-column bullets
+conn = s6.shapes.add_connector(1, Inches(7.85), Inches(2.45), Inches(12.75), Inches(2.45))
+conn.line.color.rgb = DIM; conn.line.width = Pt(1)
 
 rows = [
     ("search_similar_incidents", "[semantic] id=12 sim=0.91,\nid=9 sim=0.84, id=7 sim=0.79", GREEN),
