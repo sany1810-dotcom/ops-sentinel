@@ -10,10 +10,15 @@ Week 3 additions:
   - Graceful fallback to text-overlap search when embedding API is down (§5)
 """
 import json
+import logging
 import os
 import sqlite3
 import sys
 from pathlib import Path
+
+_log = logging.getLogger("mcp.search")
+logging.basicConfig(level=logging.INFO,
+                    format="%(asctime)s [%(levelname)s] %(name)s — %(message)s")
 
 # Works locally (agent/ sibling dir) and in Docker (memory.py + embedding_client.py copied here)
 _agent_dir = Path(__file__).parent.parent / "agent"
@@ -36,6 +41,9 @@ _EMB_MODEL = os.getenv("QWEN_EMBED_MODEL","text-embedding-v3")
 
 _memory   = IncidentMemory(db_path=DB_PATH)
 _embedder = EmbeddingClient(_API_KEY, _BASE_URL, _EMB_MODEL) if _API_KEY else None
+_log.info("EmbeddingClient init: key_set=%s model=%s available=%s",
+          bool(_API_KEY), _EMB_MODEL,
+          _embedder.available if _embedder else "N/A (no key)")
 
 mcp = FastMCP("incident-memory", host="0.0.0.0", port=_MCP_PORT)
 
@@ -98,11 +106,22 @@ def search_similar_incidents(
     Falls back to text-overlap search if embedding API is unavailable.
     Each result includes similarity_score (0.0-1.0) and search_mode.
     """
-    if _embedder and _embedder.available:
+    if _embedder is None:
+        _log.warning("semantic search skipped: no API key")
+    else:
+        # Don't gate on _embedder.available — flag sticks False after any transient
+        # startup error and never recovers. Let embed() self-recover (it resets
+        # available=True on success). Log every path so we can see why it fell back.
         query_text = build_embed_text(symptoms, metrics or {})
-        query_vec  = _embedder.embed(query_text)
-        if query_vec is not None:
+        _log.info("embedding query: %r (symptoms=%s)", query_text[:120], symptoms)
+        query_vec = _embedder.embed(query_text)
+        if query_vec is None:
+            _log.warning("semantic search failed: embed() returned None "
+                         "(embedder.available=%s)", _embedder.available)
+        else:
             results = _memory.find_similar_semantic(query_vec, limit=limit)
+            _log.info("semantic results: %d found (coverage=%s)",
+                      len(results), _memory.embedding_coverage())
             if results:
                 return [
                     {
@@ -112,8 +131,10 @@ def search_similar_incidents(
                     }
                     for inc, score in results
                 ]
-            # DB has no embeddings yet → fall through to text search
+            _log.warning("semantic search: embed OK but 0 results — "
+                         "DB has no embeddings yet?")
     # §5 fallback
+    _log.info("falling back to text-overlap search")
     return [
         {**_to_dict(i), "similarity_score": None, "search_mode": "text_fallback"}
         for i in _memory.find_similar(symptoms, limit=limit)
