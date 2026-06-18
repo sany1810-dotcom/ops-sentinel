@@ -267,3 +267,63 @@ Status page MCP Tool Calls table shows similarity scores live.
 - Three-layer fallback: semantic → text-overlap → rule-based (agent never stops)
 
 ---
+
+## Week 4 — 2026-06-18
+
+### Session 7 — Copilot mode (human-in-the-loop)
+
+**Done:**
+- `agent/memory.py`:
+  - New `PendingAction` dataclass (id, proposed_action, reasoning, symptoms, metrics_snapshot, status, created_at)
+  - New table `pending_actions` (SQLite); status ∈ {pending, approved, rejected}
+  - Methods: `save_pending_action`, `get_pending_actions`, `get_pending_action`,
+    `update_pending_status`, `has_pending_for_symptoms` (dedup guard)
+- `agent/main.py`:
+  - `AGENT_MODE` env var — `"pilot"` (default, full autonomy) | `"copilot"` (human approval)
+  - Copilot branch in `_tick()`: when `AGENT_MODE=copilot`, queues `pending_action`
+    instead of calling `ActionExecutor`; dedup prevents flooding on repeated anomaly polls
+  - `_build_reasoning()` — assembles human-readable context from Qwen diagnosis + MCP
+    tool log (sim scores from `search_similar_incidents`, diagnosis text, confidence)
+  - `_record_incident()` extracted as shared helper used by both pilot path and approve endpoint
+  - `POST /approve/:id` — executes action via `ActionExecutor`, records incident via MCP,
+    marks pending as `approved`
+  - `POST /reject/:id` — records incident with `outcome=rejected_by_human`, marks `rejected`
+  - Status page: `PILOT`/`COPILOT` badge; **PENDING APPROVALS** section with per-action cards
+    showing symptoms, reasoning, sim scores, and Approve/Reject buttons
+- `deploy/docker-compose.yml`: `AGENT_MODE=${AGENT_MODE:-pilot}` added to agent env
+- `README.md`: Copilot Mode section added
+
+**Deployed and verified on ECS 47.237.196.56 (2026-06-18):**
+```
+Test: AGENT_MODE=copilot, fault=overload injected
+
+Cycle 1 — anomaly detected:
+  → pending action #N queued (action=alert)
+  → status page shows PENDING APPROVALS section
+  → COPILOT badge visible in header
+
+Approve path:
+  POST /approve/N → outcome=alerted
+  → incident recorded via MCP (embedded OK)
+  → pending_actions.status = approved
+
+Reject path (separate test):
+  POST /reject/N → outcome=rejected_by_human
+  → incident recorded in memory with rejected outcome
+  → pending_actions.status = rejected
+
+Dedup:
+  Second anomaly poll while pending exists → "pending action already queued
+  for these symptoms — skipping" (no duplicate created)
+
+Semantic search active in copilot mode:
+  search_similar_incidents → [semantic] sim=0.94
+  sim scores surfaced in reasoning field of pending card
+```
+
+**Final state:**
+- Live: http://47.237.196.56/ — PILOT mode active by default; switch with `AGENT_MODE=copilot`
+- Four-layer architecture: detect → (copilot gate) → diagnose → act → record
+- Pilot mode and safe-mode fallback unaffected
+
+---
