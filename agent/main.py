@@ -25,7 +25,7 @@ from actions import ActionExecutor
 from collector import MetricsCollector, _TRANSPORT
 from detector import AnomalyDetector
 from mcp_client import IncidentMCPClient
-from memory import Incident, IncidentMemory
+from memory import Incident, IncidentMemory, PendingAction
 from qwen_client import QwenClient
 
 # ---------------------------------------------------------------------------
@@ -38,6 +38,7 @@ DEMO_URL       = os.environ.get("DEMO_SERVICE_URL", "http://localhost:8000")
 POLL_INTERVAL  = int(os.environ.get("AGENT_POLL_INTERVAL", "10"))
 DB_PATH        = os.environ.get("AGENT_DB_PATH", "incidents.db")
 MCP_SERVER_URL = os.environ.get("MCP_SERVER_URL", "http://localhost:8002/mcp")
+AGENT_MODE     = os.environ.get("AGENT_MODE", "pilot").strip().lower()  # "pilot" | "copilot"
 
 logging.basicConfig(
     level=logging.INFO,
@@ -59,6 +60,7 @@ _agent_state = {
     "last_incident_id": None,
     "last_mcp_calls": [],   # [{tool, args, result}, …] from most recent cycle
     "total_incidents": 0,
+    "agent_mode": AGENT_MODE,
     "uptime_start": datetime.now(timezone.utc).isoformat(),
 }
 
@@ -163,46 +165,93 @@ def _tick(
     action     = diagnosis.get("action", "alert")
     confidence = diagnosis.get("confidence", 0.0)
 
-    logger.info("Diagnosis: %s | action=%s confidence=%.2f mcp=%s",
-                diagnosis.get("diagnosis"), action, confidence, mcp.available)
+    logger.info("Diagnosis: %s | action=%s confidence=%.2f mcp=%s mode=%s",
+                diagnosis.get("diagnosis"), action, confidence, mcp.available, AGENT_MODE)
 
+    # ── Copilot mode: queue for human approval instead of executing ────────
+    if AGENT_MODE == "copilot":
+        if memory.has_pending_for_symptoms(result.symptoms):
+            logger.info("Copilot: pending action already queued for these symptoms — skipping")
+            return
+        reasoning  = _build_reasoning(diagnosis, tool_log)
+        pending_id = memory.save_pending_action(
+            proposed_action=action,
+            reasoning=reasoning,
+            symptoms=result.symptoms,
+            metrics_snapshot=metrics_dict,
+        )
+        _update_state(status="awaiting_approval")
+        logger.info("Copilot: pending action #%d queued (action=%s)", pending_id, action)
+        return
+
+    # ── Pilot mode: execute immediately ───────────────────────────────────
     outcome = executor.execute(action, diagnosis.get("diagnosis", ""))
+    _record_incident(now, metrics_dict, result.symptoms, diagnosis, action, outcome, mcp, memory)
 
-    # ── Record incident (via MCP if available, else direct) ────────────────
+
+def _record_incident(
+    now: str,
+    metrics_dict: dict,
+    symptoms: list[str],
+    diagnosis: dict,
+    action: str,
+    outcome: str,
+    mcp: "IncidentMCPClient",
+    memory: IncidentMemory,
+) -> None:
     inc = Incident(
         ts=now,
         metrics_snapshot=metrics_dict,
-        symptoms=result.symptoms,
+        symptoms=symptoms,
         diagnosis=diagnosis.get("diagnosis", ""),
         action=action,
         outcome=outcome,
         resolved=(outcome in {"restarted", "halted"}),
     )
-
     if mcp.available:
         try:
             rec = mcp.call_tool("record_incident", {
-                "ts": inc.ts,
-                "symptoms": inc.symptoms,
+                "ts": inc.ts, "symptoms": inc.symptoms,
                 "metrics_snapshot": inc.metrics_snapshot,
-                "diagnosis": inc.diagnosis,
-                "action": inc.action,
-                "outcome": inc.outcome,
-                "resolved": inc.resolved,
+                "diagnosis": inc.diagnosis, "action": inc.action,
+                "outcome": inc.outcome, "resolved": inc.resolved,
             })
             inc_id = rec.get("id") if isinstance(rec, dict) else None
-            logger.info("Incident recorded via MCP → id=%s (outcome=%s)", inc_id, outcome)
+            logger.info("Incident recorded via MCP -> id=%s (outcome=%s)", inc_id, outcome)
         except Exception as exc:
             logger.warning("MCP record_incident failed (%s) — saving directly", exc)
             inc_id = memory.save(inc)
     else:
         inc_id = memory.save(inc)
-        logger.info("Incident #%d saved to memory directly (outcome=%s)", inc_id, outcome)
-
+        logger.info("Incident #%d saved directly (outcome=%s)", inc_id, outcome)
     _update_state(
         last_incident_id=inc_id,
         total_incidents=_agent_state["total_incidents"] + 1,
     )
+
+
+def _build_reasoning(diagnosis: dict, tool_log: list[dict]) -> str:
+    """Assemble a human-readable reasoning string from Qwen diagnosis + MCP tool log."""
+    parts = []
+    for call in tool_log:
+        if call.get("tool") == "search_similar_incidents":
+            hits = [h for h in (call.get("result") or [])[:3] if isinstance(h, dict)]
+            if hits:
+                scores = ", ".join(
+                    f"id={h.get('id')} sim={h.get('similarity_score'):.3f}"
+                    if isinstance(h.get("similarity_score"), float)
+                    else f"id={h.get('id')}"
+                    for h in hits
+                )
+                mode = hits[0].get("search_mode", "")
+                parts.append(f"Similar past incidents [{mode}]: {scores}")
+    diag_text = diagnosis.get("diagnosis", "")
+    if diag_text:
+        parts.append(f"Diagnosis: {diag_text[:300]}")
+    conf = diagnosis.get("confidence")
+    if conf is not None:
+        parts.append(f"Confidence: {conf:.0%}")
+    return " | ".join(parts) if parts else "No additional context available"
 
 
 def _week1_diagnose(
@@ -302,6 +351,16 @@ _HTML = """<!DOCTYPE html>
   #msg{{margin:.4rem 0;color:#e3b341;min-height:1.2em;font-size:.85rem}}
   .result-cell{{max-width:400px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:.78rem}}
   footer{{margin-top:1.5rem;color:#484f58;font-size:.75rem}}
+  .pilot  {{background:#1a3a5c;color:#79c0ff}}
+  .copilot{{background:#5a3e00;color:#e3b341}}
+  .awaiting{{background:#6e3513;color:#f0883e}}
+  .btn-approve{{background:#1f6b2e;color:#56d364}}
+  .btn-approve:hover{{background:#2a8a3e}}
+  .btn-reject{{background:#6e1313;color:#f85149}}
+  .btn-reject:hover{{background:#8a1a1a}}
+  .pending-card{{border:1px solid #30363d;border-radius:6px;padding:.8rem 1rem;margin:.5rem 0;background:#161b22}}
+  .pending-card .action-badge{{display:inline-block;padding:2px 8px;border-radius:3px;font-weight:bold;font-size:.8rem;background:#5a3e00;color:#e3b341;margin-bottom:.4rem}}
+  .reasoning{{font-size:.8rem;color:#8b949e;margin:.3rem 0;white-space:pre-wrap;word-break:break-word}}
 </style>
 </head>
 <body>
@@ -309,6 +368,7 @@ _HTML = """<!DOCTYPE html>
 <p>Status: <span class="badge {status_cls}">{status}</span>
 {safe_badge}
 <span class="badge {mcp_cls}">MCP {mcp_label}</span>
+<span class="badge {mode_cls}">{mode_label}</span>
 &nbsp;&nbsp;<span class="ts">Last check: {last_check}</span>
 &nbsp;&nbsp;<span class="ts">Total incidents: {total_incidents}</span></p>
 
@@ -333,6 +393,8 @@ _HTML = """<!DOCTYPE html>
 {mcp_rows}
 </table>
 
+{pending_section}
+
 <h2>Recent Incidents — Memory (last 10)</h2>
 <table>
 <tr><th>#</th><th>Time (UTC)</th><th>Symptoms</th><th>Diagnosis</th><th>Action</th><th>Outcome</th><th>OK?</th></tr>
@@ -354,22 +416,41 @@ async function resetDemo() {{
   const d = await r.json();
   document.getElementById('msg').textContent = r.ok ? 'Reset: ' + JSON.stringify(d) : 'Error: ' + JSON.stringify(d);
 }}
+async function approveAction(id) {{
+  document.getElementById('msg').textContent = 'Approving #' + id + '...';
+  const r = await fetch('/approve/' + id, {{method:'POST'}});
+  const d = await r.json();
+  document.getElementById('msg').textContent = r.ok ? 'Approved: outcome=' + d.outcome : 'Error: ' + JSON.stringify(d);
+  if (r.ok) setTimeout(() => location.reload(), 1200);
+}}
+async function rejectAction(id) {{
+  document.getElementById('msg').textContent = 'Rejecting #' + id + '...';
+  const r = await fetch('/reject/' + id, {{method:'POST'}});
+  const d = await r.json();
+  document.getElementById('msg').textContent = r.ok ? 'Rejected #' + id : 'Error: ' + JSON.stringify(d);
+  if (r.ok) setTimeout(() => location.reload(), 1200);
+}}
 </script>
 </body>
 </html>"""
 
 
-def _render_status(state: dict, incidents) -> str:
+def _render_status(state: dict, incidents, pending) -> str:
     import json as _json
 
     status = state.get("status", "unknown")
-    status_cls = status if status in {"healthy", "anomaly", "halted"} else "anomaly"
+    status_cls = status if status in {"healthy", "anomaly", "halted"} else (
+        "awaiting" if status == "awaiting_approval" else "anomaly"
+    )
     safe_badge = (
         '<span class="badge safe">SAFE MODE</span>' if state.get("safe_mode") else ""
     )
     mcp_on = state.get("mcp_available", False)
     mcp_cls   = "mcp-on" if mcp_on else "mcp-off"
     mcp_label = "ON" if mcp_on else "OFF"
+    mode = state.get("agent_mode", AGENT_MODE)
+    mode_cls   = "copilot" if mode == "copilot" else "pilot"
+    mode_label = "COPILOT" if mode == "copilot" else "PILOT"
 
     metrics = state.get("last_metrics", {})
     metrics_rows = "\n".join(
@@ -432,6 +513,35 @@ def _render_status(state: dict, incidents) -> str:
         "<tr><td colspan=7 style='color:#484f58'>No incidents yet</td></tr>"
     )
 
+    # Pending approvals section
+    if pending:
+        cards = []
+        for pa in pending:
+            sym_s = ", ".join(pa.symptoms)
+            rea_s = (pa.reasoning or "")[:400]
+            cards.append(
+                f"<div class='pending-card'>"
+                f"<span class='action-badge'>&#9654; {pa.proposed_action.upper()}</span>"
+                f"&nbsp;&nbsp;<span class='ts'>#{pa.id} &mdash; {pa.created_at[:19]}</span><br>"
+                f"<b>Symptoms:</b> {sym_s}<br>"
+                f"<div class='reasoning'>{rea_s}</div>"
+                f"<div style='margin-top:.5rem;display:flex;gap:.5rem'>"
+                f"<button class='btn-approve' onclick='approveAction({pa.id})'>&#10003; Approve</button>"
+                f"<button class='btn-reject'  onclick='rejectAction({pa.id})'>&#10007; Reject</button>"
+                f"</div></div>"
+            )
+        pending_section = (
+            "<h2>Pending Approvals "
+            f"<span class='badge copilot'>{len(pending)}</span></h2>"
+            + "\n".join(cards)
+        )
+    else:
+        pending_section = (
+            "<h2>Pending Approvals</h2>"
+            "<p style='color:#484f58;font-size:.85rem'>No pending actions</p>"
+            if mode == "copilot" else ""
+        )
+
     uptime = (state.get("uptime_start") or "")[:19]
 
     return _HTML.format(
@@ -440,10 +550,13 @@ def _render_status(state: dict, incidents) -> str:
         safe_badge=safe_badge,
         mcp_cls=mcp_cls,
         mcp_label=mcp_label,
+        mode_cls=mode_cls,
+        mode_label=mode_label,
         last_check=(state.get("last_check") or "—")[:19],
         total_incidents=state.get("total_incidents", 0),
         metrics_rows=metrics_rows,
         mcp_rows=mcp_rows,
+        pending_section=pending_section,
         incident_rows=incident_rows,
         uptime=uptime,
     )
@@ -451,7 +564,11 @@ def _render_status(state: dict, incidents) -> str:
 
 @app.get("/", response_class=HTMLResponse)
 async def status_page():
-    return _render_status(_get_state(), _memory.get_recent(10))
+    return _render_status(
+        _get_state(),
+        _memory.get_recent(10),
+        _memory.get_pending_actions("pending"),
+    )
 
 
 @app.get("/api/status")
@@ -477,6 +594,35 @@ async def api_mcp_calls():
     return JSONResponse(_get_state().get("last_mcp_calls", []))
 
 
+@app.post("/approve/{pending_id}")
+async def approve_action(pending_id: int):
+    pa = _memory.get_pending_action(pending_id)
+    if not pa or pa.status != "pending":
+        raise HTTPException(status_code=404, detail="Not found or already resolved")
+    now     = datetime.now(timezone.utc).isoformat()
+    outcome = _executor.execute(pa.proposed_action, pa.reasoning)
+    diagnosis_stub = {"diagnosis": pa.reasoning, "action": pa.proposed_action, "confidence": 1.0}
+    _record_incident(now, pa.metrics_snapshot, pa.symptoms,
+                     diagnosis_stub, pa.proposed_action, outcome, _mcp, _memory)
+    _memory.update_pending_status(pending_id, "approved")
+    logger.info("Copilot: pending #%d APPROVED — outcome=%s", pending_id, outcome)
+    return {"status": "approved", "outcome": outcome}
+
+
+@app.post("/reject/{pending_id}")
+async def reject_action(pending_id: int):
+    pa = _memory.get_pending_action(pending_id)
+    if not pa or pa.status != "pending":
+        raise HTTPException(status_code=404, detail="Not found or already resolved")
+    now = datetime.now(timezone.utc).isoformat()
+    diagnosis_stub = {"diagnosis": pa.reasoning, "action": pa.proposed_action, "confidence": 1.0}
+    _record_incident(now, pa.metrics_snapshot, pa.symptoms,
+                     diagnosis_stub, pa.proposed_action, "rejected_by_human", _mcp, _memory)
+    _memory.update_pending_status(pending_id, "rejected")
+    logger.info("Copilot: pending #%d REJECTED", pending_id)
+    return {"status": "rejected"}
+
+
 @app.get("/health")
 async def health():
     state = _get_state()
@@ -486,17 +632,21 @@ async def health():
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
-_memory: IncidentMemory
+_memory:   IncidentMemory
+_executor: ActionExecutor
+_mcp:      IncidentMCPClient
 
 
 def main():
-    global _memory
+    global _memory, _executor, _mcp
     _memory   = IncidentMemory(DB_PATH)
     collector = MetricsCollector(DEMO_URL)
     detector  = AnomalyDetector()
     qwen      = QwenClient(QWEN_API_KEY, QWEN_BASE_URL, QWEN_MODEL)
-    executor  = ActionExecutor(collector)
-    mcp       = IncidentMCPClient(MCP_SERVER_URL)
+    _executor = ActionExecutor(collector)
+    _mcp      = IncidentMCPClient(MCP_SERVER_URL)
+    executor  = _executor
+    mcp       = _mcp
 
     t = threading.Thread(
         target=_agent_loop,

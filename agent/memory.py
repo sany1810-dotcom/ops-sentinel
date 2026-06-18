@@ -4,6 +4,7 @@ Persistent incident memory backed by SQLite.
 Week 1: symptom-overlap scoring (find_similar)
 Week 3: semantic embedding search (find_similar_semantic) — separate table,
         fully backward-compatible; old methods untouched.
+Copilot: pending_actions table for human-in-the-loop approval flow.
 """
 import json
 import sqlite3
@@ -23,6 +24,17 @@ class Incident:
     action: str
     outcome: str
     resolved: bool
+    id: Optional[int] = field(default=None)
+
+
+@dataclass
+class PendingAction:
+    proposed_action: str
+    reasoning: str
+    symptoms: list[str]
+    metrics_snapshot: dict
+    created_at: str
+    status: str = "pending"
     id: Optional[int] = field(default=None)
 
 
@@ -59,6 +71,18 @@ class IncidentMemory:
                     embedding   BLOB    NOT NULL,
                     created_at  TEXT    NOT NULL,
                     FOREIGN KEY (incident_id) REFERENCES incidents(id)
+                )
+            """)
+            # Copilot mode: human-in-the-loop approval queue
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS pending_actions (
+                    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+                    proposed_action  TEXT    NOT NULL,
+                    reasoning        TEXT,
+                    symptoms         TEXT    NOT NULL,
+                    metrics_snapshot TEXT    NOT NULL,
+                    status           TEXT    NOT NULL DEFAULT 'pending',
+                    created_at       TEXT    NOT NULL
                 )
             """)
 
@@ -180,7 +204,69 @@ class IncidentMemory:
             embedded = conn.execute("SELECT COUNT(*) FROM incident_embeddings").fetchone()[0]
         return embedded, total
 
+    # ── Copilot / pending-action methods ─────────────────────────────────
+
+    def save_pending_action(
+        self,
+        proposed_action: str,
+        reasoning: str,
+        symptoms: list[str],
+        metrics_snapshot: dict,
+    ) -> int:
+        now = datetime.now(timezone.utc).isoformat()
+        with self._conn() as conn:
+            cur = conn.execute(
+                """INSERT INTO pending_actions
+                   (proposed_action, reasoning, symptoms, metrics_snapshot, status, created_at)
+                   VALUES (?, ?, ?, ?, 'pending', ?)""",
+                (proposed_action, reasoning,
+                 json.dumps(symptoms), json.dumps(metrics_snapshot), now),
+            )
+            return cur.lastrowid
+
+    def get_pending_actions(self, status: str = "pending") -> list[PendingAction]:
+        with self._conn() as conn:
+            rows = conn.execute(
+                "SELECT * FROM pending_actions WHERE status=? ORDER BY created_at ASC",
+                (status,),
+            ).fetchall()
+        return [self._row_to_pending(r) for r in rows]
+
+    def get_pending_action(self, pending_id: int) -> Optional[PendingAction]:
+        with self._conn() as conn:
+            row = conn.execute(
+                "SELECT * FROM pending_actions WHERE id=?", (pending_id,)
+            ).fetchone()
+        return self._row_to_pending(row) if row else None
+
+    def update_pending_status(self, pending_id: int, status: str) -> None:
+        with self._conn() as conn:
+            conn.execute(
+                "UPDATE pending_actions SET status=? WHERE id=?",
+                (status, pending_id),
+            )
+
+    def has_pending_for_symptoms(self, symptoms: list[str]) -> bool:
+        """True if there is already an unresolved pending action with the same symptom set."""
+        key = json.dumps(sorted(symptoms))
+        with self._conn() as conn:
+            rows = conn.execute(
+                "SELECT symptoms FROM pending_actions WHERE status='pending'"
+            ).fetchall()
+        return any(json.dumps(sorted(json.loads(r["symptoms"]))) == key for r in rows)
+
     # ── helpers ───────────────────────────────────────────────────────────
+
+    def _row_to_pending(self, row: sqlite3.Row) -> PendingAction:
+        return PendingAction(
+            id=row["id"],
+            proposed_action=row["proposed_action"],
+            reasoning=row["reasoning"] or "",
+            symptoms=json.loads(row["symptoms"]),
+            metrics_snapshot=json.loads(row["metrics_snapshot"]),
+            status=row["status"],
+            created_at=row["created_at"],
+        )
 
     def _row_to_incident(self, row: sqlite3.Row) -> Incident:
         return Incident(

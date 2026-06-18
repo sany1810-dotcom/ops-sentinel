@@ -42,6 +42,7 @@ services:
       - MCP_SERVER_URL=http://incident-mcp-server:8002/mcp
       - AGENT_POLL_INTERVAL=${AGENT_POLL_INTERVAL:-10}
       - AGENT_DB_PATH=/data/incidents.db
+      - AGENT_MODE=${AGENT_MODE:-pilot}
     depends_on:
       - demo-service
       - incident-mcp-server

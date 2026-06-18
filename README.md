@@ -153,6 +153,28 @@ curl -X POST http://localhost/demo/reset
 
 ---
 
+## Copilot Mode (Human-in-the-Loop)
+
+By default the agent runs in **Pilot mode** — fully autonomous: detect → diagnose → act → record.
+
+Set `AGENT_MODE=copilot` to require human approval before any action is executed.
+
+```bash
+# In .env or directly:
+AGENT_MODE=copilot
+docker compose -f deploy/docker-compose.yml up -d
+```
+
+In Copilot mode:
+- When the agent diagnoses a fault it writes a **pending action** to SQLite instead of executing
+- The status page shows a **PENDING APPROVALS** section with the proposed action, Qwen's reasoning, and similarity scores from semantic search
+- Click **Approve** → action executes (restart / alert / halt) and incident is recorded in memory
+- Click **Reject** → no action taken; incident recorded with `outcome=rejected_by_human`
+- Duplicate anomaly cycles are deduplicated — one pending entry per active symptom set
+- If MCP or Qwen is down, the pending action is still created using rule-based reasoning (safe-mode path)
+
+Useful for production environments where automated restarts need a second pair of eyes.
+
 ## Repository Layout
 
 ```
